@@ -47,7 +47,7 @@ import {
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai/oauth";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
-import { createOAuthInteraction, toOAuthCredential } from "../src/oauth-compat.mts";
+import { createOAuthInteraction, refreshOpenAICodexToken, toOAuthCredential } from "../src/oauth-compat.mts";
 import {
 	Container,
 	Key,
@@ -114,7 +114,7 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 					return openaiCodexOAuth.login(createOAuthInteraction(callbacks));
 				},
 				async refreshToken(credentials: OAuthCredentials, signal: AbortSignal): Promise<OAuthCredentials> {
-					return openaiCodexOAuth.refresh(toOAuthCredential(credentials), signal);
+					return refreshOpenAICodexToken(credentials, signal);
 				},
 				getApiKey(credentials: OAuthCredentials): string {
 					return credentials.access;
@@ -1056,6 +1056,12 @@ function normalizeProjectConfig(raw: unknown): ProjectConfig {
 	return config;
 }
 
+function defaultCodexPool(subscriptions: SubEntry[], pools: PoolConfig[]): PoolConfig[] {
+  if (pools.length > 0) return pools;
+  const members = ["openai-codex", ...subscriptions.map((entry) => subProviderName(entry))].filter((name, index, all) => all.indexOf(name) === index);
+  return members.length > 1 ? [{ name: "codex-auto", baseProvider: "openai-codex", members, enabled: true, strategy: "quota-first" }] : pools;
+}
+
 function loadGlobalConfig(): MultiPassConfig {
 	const path = globalConfigPath();
 	if (!existsSync(path)) return emptyMultiPassConfig();
@@ -1118,7 +1124,7 @@ function loadEffectiveConfig(cwd: string): EffectiveConfig {
 	if (!project) {
 		return {
 			subscriptions: mergedSubscriptions,
-			pools: global.pools,
+			pools: defaultCodexPool(mergedSubscriptions, global.pools),
 			chains: global.chains,
 			presets: global.presets,
 		};
@@ -1136,7 +1142,8 @@ function loadEffectiveConfig(cwd: string): EffectiveConfig {
 	if (allowedProviderNames) {
 		pools = filterPoolsByAllowedProviders(pools, allowedProviderNames);
 		chains = filterChainsByAvailablePools(chains, pools);
-	}
+  }
+  pools = defaultCodexPool(subs, pools);
 
 	return {
 		subscriptions: subs,

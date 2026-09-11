@@ -102,6 +102,46 @@ export function createOAuthInteraction(callbacks: OAuthLoginCallbacks): AuthInte
 	};
 }
 
+const OPENAI_CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token";
+const OPENAI_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
+
+type TokenFetch = (input: string, init: RequestInit) => Promise<Pick<Response, "ok" | "status" | "statusText" | "text" | "json">>;
+
+export async function refreshOpenAICodexToken(
+credentials: OAuthCredentials,
+signal: AbortSignal,
+fetchImpl: TokenFetch = fetch,
+ ): Promise<OAuthCredentials> {
+const response = await fetchImpl(OPENAI_CODEX_TOKEN_URL, {
+method: "POST",
+headers: { "Content-Type": "application/x-www-form-urlencoded" },
+body: new URLSearchParams({
+grant_type: "refresh_token",
+refresh_token: credentials.refresh,
+client_id: OPENAI_CODEX_CLIENT_ID,
+}),
+signal,
+});
+
+if (!response.ok) {
+const body = await response.text().catch(() => "");
+throw new Error(`OpenAI Codex token refresh failed (${response.status}): ${body || response.statusText}`);
+}
+
+const token = await response.json() as { access_token?: unknown; refresh_token?: unknown; expires_in?: unknown };
+if (typeof token.access_token !== "string" || typeof token.expires_in !== "number") {
+throw new Error("OpenAI Codex token refresh response missing access_token or expires_in");
+}
+
+return {
+...credentials,
+type: "oauth",
+access: token.access_token,
+refresh: typeof token.refresh_token === "string" && token.refresh_token ? token.refresh_token : credentials.refresh,
+expires: Date.now() + token.expires_in * 1000,
+};
+}
+
 export function toOAuthCredential(credentials: OAuthCredentials): OAuthCredential {
-	return { ...credentials, type: "oauth" };
+return { ...credentials, type: "oauth" };
 }
