@@ -1035,6 +1035,7 @@ interface EffectiveConfig {
 	pools: PoolConfig[];
 	chains: ChainConfig[];
 	presets: PresetConfig[];
+	maxRetries: number;
 	/** Exact provider names allowed in this project, if restricted. */
 	allowedProviderNames?: string[];
 	/** Which project config was loaded from, if any */
@@ -1231,6 +1232,12 @@ function invalidateEffectiveConfigCache(): void {
 	effectiveConfigCache = null;
 }
 
+function defaultCodexPool(subscriptions: SubEntry[], pools: PoolConfig[]): PoolConfig[] {
+	if (pools.length > 0) return pools;
+	const members = ["openai-codex", ...subscriptions.map(subProviderName)].filter((name, index, all) => all.indexOf(name) === index);
+	return members.length > 1 ? [{ name: "codex-auto", baseProvider: "openai-codex", members, enabled: true, strategy: "quota-first" }] : pools;
+}
+
 function loadEffectiveConfig(cwd: string): EffectiveConfig {
 	// mtime-based cache: loadEffectiveConfig runs on every input/agent_end and
 	// re-reads both config files each time; the key changes whenever a file is
@@ -1246,9 +1253,10 @@ function loadEffectiveConfig(cwd: string): EffectiveConfig {
 	if (!project) {
 		const value: EffectiveConfig = {
 			subscriptions: mergedSubscriptions,
-			pools: global.pools,
+			pools: defaultCodexPool(mergedSubscriptions, global.pools),
 			chains: global.chains,
 			presets: global.presets,
+			maxRetries: global.maxRetries,
 		};
 		effectiveConfigCache = { key, value };
 		return value;
@@ -1267,12 +1275,14 @@ function loadEffectiveConfig(cwd: string): EffectiveConfig {
 		pools = filterPoolsByAllowedProviders(pools, allowedProviderNames);
 		chains = filterChainsByAvailablePools(chains, pools);
 	}
+	pools = defaultCodexPool(subs, pools);
 
 	const value: EffectiveConfig = {
 		subscriptions: subs,
 		pools,
 		chains,
 		presets: global.presets,
+		maxRetries: global.maxRetries,
 		allowedProviderNames,
 		projectConfigPath: projectConfigPath(cwd),
 	};
@@ -1767,6 +1777,8 @@ class PoolManager {
 	private pi: ExtensionAPI;
 	private cascadeState: FailoverCascadeState | null = null;
 	private suppressNextStartTurn = false;
+	/** Set when a rotation retry was handed to sendUserMessage (fire-and-forget). */
+	retryPromptPending = false;
 
 	constructor(pi: ExtensionAPI) {
 		this.pi = pi;
@@ -2245,6 +2257,7 @@ class PoolManager {
 			this.cascadeState = {
 				attemptedProviders: new Set([currentModel.provider]),
 				visitedChainIndexes: new Set<number>(),
+				attempts: 0,
 			};
 		} else {
 			this.cascadeState.attemptedProviders.add(currentModel.provider);
@@ -2267,6 +2280,7 @@ class PoolManager {
 			? {
 					attemptedProviders: new Set([currentModel.provider]),
 					visitedChainIndexes: new Set<number>(),
+					attempts: 0,
 				}
 			: null;
 	}
@@ -2346,9 +2360,8 @@ class PoolManager {
 		// candidate instead of declaring the cascade exhausted. The number of
 		// extension-driven switch attempts is bounded by config.maxRetries.
 		const maxAttempts = Math.max(1, config.maxRetries ?? DEFAULT_MAX_RETRIES);
-		let attempts = 0;
 		for (const nextCandidate of plan.candidates) {
-			if (attempts >= maxAttempts) {
+			if (cascade.attempts >= maxAttempts) {
 				ctx.ui.notify(
 					`[pool:${pool.name}] failover attempt bound reached (${maxAttempts}); stopping cascade`,
 					"warning",
@@ -2365,7 +2378,7 @@ class PoolManager {
 				continue;
 			}
 
-			attempts++;
+			cascade.attempts++;
 			let success: boolean;
 			try {
 				success = await this.pi.setModel(nextModel);
@@ -2398,6 +2411,7 @@ class PoolManager {
 
 			if (lastUserPrompt) {
 				this.suppressNextStartTurn = true;
+				this.retryPromptPending = true;
 				this.pi.sendUserMessage(lastUserPrompt, { deliverAs: "followUp" });
 			}
 
@@ -4084,6 +4098,7 @@ interface FailoverPlan {
 interface FailoverCascadeState {
 	attemptedProviders: Set<string>;
 	visitedChainIndexes: Set<number>;
+	attempts: number;
 }
 
 function formatFailoverTarget(candidate: Pick<FailoverCandidate, "provider" | "modelId">): string {
@@ -5267,6 +5282,18 @@ export default function multiSub(pi: ExtensionAPI) {
 		poolManager.startTurn(ctx.model);
 	});
 
+	// sendUserMessage awaits input handlers before queueing the follow-up, so
+	// agent_end returns first and Pi would settle (auto-exit subagents shut down
+	// here). Hold settlement until the retry prompt is actually queued.
+	pi.on("agent_before_settle", async (_event, ctx) => {
+		if (!poolManager.retryPromptPending) return;
+		poolManager.retryPromptPending = false;
+		const deadline = Date.now() + 10_000;
+		while (!ctx.hasPendingMessages() && Date.now() < deadline) {
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+	});
+
 	// Listen for errors to trigger pool rotation
 	pi.on("agent_end", async (event: AgentEndEvent, ctx: ExtensionContext) => {
 		if (!event.messages || event.messages.length === 0) return;
@@ -5289,6 +5316,7 @@ export default function multiSub(pi: ExtensionAPI) {
 				pools: effective.pools,
 				chains: effective.chains,
 				presets: effective.presets,
+				maxRetries: effective.maxRetries,
 			}),
 		);
 
